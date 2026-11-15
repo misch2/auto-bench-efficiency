@@ -1,6 +1,7 @@
 """Behavioral checks with simulated registers, serial traffic and time; no hardware."""
 
 import csv
+import importlib.util
 import json
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -13,6 +14,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import measure_efficiency as tool
+
+
+class NoResponseError(IOError):
+    pass
+
+
+class InvalidResponseError(IOError):
+    pass
 
 
 class Clock:
@@ -67,7 +76,9 @@ class Rig:
         self.module = SimpleNamespace(instrument=self.instrument, volts_resolution=100,
                                       amps_resolution=1000, max_set_current=6,
                                       max_ocp_current=6.2, max_set_voltage=25,
-                                      get_input_voltage=self.input_voltage)
+                                      get_input_voltage=self.input_voltage,
+                                      _read_registers=lambda address, count, retries=3:
+                                      self.instrument.read_registers(address, count))
 
     def input_voltage(self):
         if self.fail_input:
@@ -174,6 +185,24 @@ class EfficiencyTests(unittest.TestCase):
         self.source.set_enabled(True)
         self.load.receive(tool.ATORCH_REPORT, 4)
 
+    def upstream_device(self):
+        # Import the complete pinned production library with a simulated
+        # MinimalModbus boundary. Never open a serial port in these tests.
+        path = tool.TOOLS / "RK6006-Python-Module" / "RK6006_module.py"
+        spec = importlib.util.spec_from_file_location("rk6006_retry_test", path)
+        library = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"minimalmodbus": SimpleNamespace(
+            NoResponseError=NoResponseError, InvalidResponseError=InvalidResponseError
+        )}):
+            spec.loader.exec_module(library)
+        library.time = self.clock
+        device = library.RK6006.__new__(library.RK6006)
+        for name, value in vars(self.rig.module).items():
+            if name != "_read_registers":
+                setattr(device, name, value)
+        device.model, device.sn, device.fw = "RK6006", 5072, 1.07
+        return device
+
     def run_rig(self, args):
         if not args.probe and args.output_dir is None:
             temporary = TemporaryDirectory()
@@ -240,6 +269,66 @@ class EfficiencyTests(unittest.TestCase):
         with patch.object(self.rig.instrument, "read_register", return_value=0):
             with self.assertRaisesRegex(RuntimeError, "did not confirm"):
                 self.source.set_voltage(5)
+
+    def test_transient_rk_timeout_recovers_without_output_writes(self):
+        self.configured()
+        output = StringIO()
+        source = tool.RKSource(self.upstream_device(), tool.DebugLog(output))
+        registers = self.rig.instrument.read_registers(10, 9)
+        before = list(self.rig.writes)
+        with patch.object(self.rig.instrument, "read_registers", side_effect=[NoResponseError("no answer"), registers]) as read:
+            self.assertEqual(source.read(), (5, 0.1))
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(self.rig.writes, before)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[0]["event"], "rk_read_request")
+        self.assertEqual(events[0]["max_attempts"], 3)
+        self.assertEqual(events[-1]["event"], "rk_read")
+        self.assertAlmostEqual(events[-1]["duration_s"], 0.01)
+
+    def test_invalid_rk_reply_and_timeout_recover_on_third_attempt(self):
+        self.configured()
+        source = tool.RKSource(self.upstream_device())
+        registers = self.rig.instrument.read_registers(10, 9)
+        errors = [InvalidResponseError("bad CRC"), NoResponseError("no answer"), registers]
+        with patch.object(self.rig.instrument, "read_registers", side_effect=errors) as read:
+            self.assertEqual(source.read(), (5, 0.1))
+        self.assertEqual(read.call_count, 3)
+
+    def test_persistent_rk_timeout_is_bounded_and_logged(self):
+        output = StringIO()
+        source = tool.RKSource(self.upstream_device(), tool.DebugLog(output))
+        with patch.object(self.rig.instrument, "read_registers", side_effect=NoResponseError("no answer")) as read:
+            with self.assertRaises(NoResponseError):
+                source.read()
+        self.assertEqual(read.call_count, 3)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["event"], "rk_read_error")
+        self.assertEqual(events[-1]["error_type"], "NoResponseError")
+
+    def test_other_rk_io_errors_are_not_retried(self):
+        source = tool.RKSource(self.upstream_device())
+        with patch.object(self.rig.instrument, "read_registers", side_effect=OSError("device disconnected")) as read:
+            with self.assertRaisesRegex(OSError, "device disconnected"):
+                source.read()
+        self.assertEqual(read.call_count, 1)
+
+    def test_persistent_rk_timeout_stops_run_and_verifies_shutdown(self):
+        self.rig.module = self.upstream_device()
+        read = self.rig.instrument.read_registers
+        live_attempts = []
+
+        def missing_measurement(address, count):
+            if address == 10:
+                live_attempts.append(address)
+                raise NoResponseError("No communication with the instrument (no answer)")
+            return read(address, count)
+
+        with patch.object(self.rig.instrument, "read_registers", side_effect=missing_measurement):
+            with self.assertRaises(NoResponseError):
+                self.run_rig(arguments(voltages=(15,), currents=(0.25,)))
+        self.assertEqual(len(live_attempts), 3)
+        self.assert_restored()
 
     def test_constant_power_integration(self):
         self.configured()
