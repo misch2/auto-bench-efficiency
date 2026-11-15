@@ -1,0 +1,4 @@
+[submodule "RK6006-Python-Module"]
+	path = RK6006-Python-Module
+	url = https://github.com/dzwer/RK6006-Python-Module.git
+	ignore = untracked
