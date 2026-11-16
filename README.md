@@ -1,4 +1,4 @@
-# Bench Efficiency
+# Auto Bench Efficiency
 
 Automatic DC power-transfer measurements with a **RIDEN RK6006 supply** and an
 **ATORCH DL24P electronic load**. Choose supply voltages and load currents, start
@@ -47,9 +47,15 @@ current path; suitable isolated communication can avoid this problem.
 
 ## Install once
 
-Obtain this project **with its Git submodule**. If cloning it, include submodules
-(`git clone --recurse-submodules ...`). Then open PowerShell in the project
-folder. If the folder already exists, this command fetches its RK6006 library:
+Clone this project **with its Git submodule**, then enter its folder:
+
+```powershell
+git clone --recurse-submodules https://github.com/misch2/auto-bench-efficiency.git
+cd auto-bench-efficiency
+```
+
+If you already have the project folder, open PowerShell there. This command
+fetches its RK6006 library:
 
 ```powershell
 git submodule update --init --recursive
@@ -259,8 +265,10 @@ leaves the permitted operating range, the program rejects that entire window,
 keeps both outputs on, waits for settling again and retries the point once.
 The CSV/HTML **Attempts**
 column shows whether a point needed repeating. Rejected attempts remain in the
-debug log. Repeated deviations stop the test; communication errors and supply
-protection trips stop it immediately.
+debug log. Repeated deviations stop the test; ATORCH communication errors and
+supply protection trips stop it immediately. Read-only RK6006 queries allow
+up to three attempts for a missing or invalid reply; if all fail, the run stops
+and attempts shutdown. Writes are not retried.
 
 ### What the percentage means
 
@@ -370,6 +378,6 @@ and settings, but no passwords are requested by this program.
 - [DL24P serial interface notes](https://github.com/tshaddack/dl24#protocol)
 - [RK6006 Python interface](https://github.com/dzwer/RK6006-Python-Module)
 
-Bench Efficiency is provided under the [MIT license](LICENSE). The separate
+Auto Bench Efficiency is provided under the [MIT license](LICENSE). The separate
 RK6006 interface is an upstream Git submodule; see [DEVELOPMENT.md](DEVELOPMENT.md)
 for its provenance and the offline test command.

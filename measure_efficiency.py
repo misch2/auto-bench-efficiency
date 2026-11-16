@@ -143,9 +143,29 @@ class RKSource:
         self.amps_resolution = module.amps_resolution
         self.instrument.serial.write_timeout = 0.5
 
+    def read_registers(self, address, count):
+        started = time.monotonic()
+        self.debug("rk_read_request", address=address, count=count, max_attempts=3)
+        try:
+            # The pinned library bounds read-only retries for missing/invalid
+            # replies. Avoid its recursive write helper: writes stay single-shot.
+            registers = self.module._read_registers(address, count, retries=3)
+        except (Exception, KeyboardInterrupt) as error:
+            self.debug(
+                "rk_read_error", address=address, count=count,
+                duration_s=time.monotonic() - started,
+                error_type=type(error).__name__, error=str(error),
+            )
+            raise
+        self.debug(
+            "rk_read", address=address, registers=registers,
+            duration_s=time.monotonic() - started,
+        )
+        return registers
+
     def snapshot_settings(self):
-        voltage, current = self.instrument.read_registers(8, 2)
-        ovp, ocp = self.instrument.read_registers(82, 2)
+        voltage, current = self.read_registers(8, 2)
+        ovp, ocp = self.read_registers(82, 2)
         settings = {8: voltage, 9: current, 82: ovp, 83: ocp}
         self.debug("rk_settings", registers=settings)
         return settings
@@ -207,8 +227,7 @@ class RKSource:
         )
 
     def read(self):
-        registers = self.instrument.read_registers(10, 9)
-        self.debug("rk_read", address=10, registers=registers)
+        registers = self.read_registers(10, 9)
         voltage, current, _, _, _, _, protection, mode, enabled = registers
         if protection or enabled != 1:
             name = {0: "OK", 1: "OVP", 2: "OCP"}.get(protection, "unknown")
