@@ -190,9 +190,9 @@ class RKSource:
 
     def configure_limits(self, args):
         current_limit, ovp, ocp = planned_limits(args)
-        voltages = operating_voltages(args)
+        voltages = args.voltages
         if (
-            max(current_limit, args.startup_current or 0) > self.module.max_set_current
+            current_limit > self.module.max_set_current
             or ocp > self.module.max_ocp_current
         ):
             raise ValueError("Requested current limit or OCP exceeds the RK6006 range")
@@ -203,7 +203,6 @@ class RKSource:
             raise ValueError(
                 "RK6006 input voltage is too low for the requested voltage/OVP"
             )
-        initial_current_limit = args.startup_current if args.startup_current is not None else current_limit
         ovp_register = round(ovp * self.volts_resolution)
         ocp_register = round(ocp * self.amps_resolution)
         if args.keep_source_on:
@@ -212,17 +211,16 @@ class RKSource:
             previous_ovp, previous_ocp = self.instrument.read_registers(82, 2)
             self.write_verified(82, max(previous_ovp, ovp_register))
             self.write_verified(83, max(previous_ocp, ocp_register))
-            self.set_current_limit(initial_current_limit)
-            self.set_voltage(args.startup_voltage if args.startup_voltage is not None else args.voltages[0])
+            self.set_current_limit(current_limit)
+            self.set_voltage(args.voltages[0])
         else:
             self.set_enabled(False)
         self.write_verified(82, ovp_register)
         self.write_verified(83, ocp_register)
         if not args.keep_source_on:
-            self.set_current_limit(initial_current_limit)
+            self.set_current_limit(current_limit)
         print(
-            f"RK6006 sweep limits: CC {current_limit:g} A, OVP {ovp:g} V, OCP {ocp:g} A"
-            + (f"; startup CC {args.startup_current:g} A" if args.startup_current is not None else ""),
+            f"RK6006 sweep limits: CC {current_limit:g} A, OVP {ovp:g} V, OCP {ocp:g} A",
             flush=True,
         )
 
@@ -475,26 +473,18 @@ class Point:
     attempts: int = 1
 
 
-def operating_voltages(args):
-    voltages = tuple(args.voltages)
-    if args.startup_voltage is not None:
-        voltages += (args.startup_voltage,)
-    return voltages
-
-
 def planned_limits(args):
-    voltages = operating_voltages(args)
+    voltages = args.voltages
     current_limit = args.source_current_limit
-    highest_current_limit = max(current_limit, args.startup_current or 0)
     ovp = round(args.ovp if args.ovp is not None else max(voltages) * 1.1, 2)
-    ocp = round(args.ocp if args.ocp is not None else highest_current_limit * 1.1, 3)
+    ocp = round(args.ocp if args.ocp is not None else current_limit * 1.1, 3)
     if not math.isfinite(ovp) or ovp <= max(voltages):
         raise ValueError(
-            "--ovp must exceed the highest test/startup voltage (at 0.01 V resolution)"
+            "--ovp must exceed the highest test voltage (at 0.01 V resolution)"
         )
-    if not math.isfinite(ocp) or ocp <= highest_current_limit:
+    if not math.isfinite(ocp) or ocp <= current_limit:
         raise ValueError(
-            "--ocp must exceed both source current limits (at 0.001 A resolution)"
+            "--ocp must exceed the source current limit (at 0.001 A resolution)"
         )
     return current_limit, ovp, ocp
 
@@ -600,7 +590,7 @@ def wait_for_settle(source, load, voltage, current, args):
             if time.monotonic() <= deadline and consecutive >= 3:
                 print(
                     f"  Settled after {time.monotonic() - started:.1f} s "
-                    f"({values[0]:.3f} V, {values[4]:.3f} A)",
+                    f"({values[0]:.3f} V -> {values[4]:.3f} A)",
                     flush=True,
                 )
                 source.debug(
@@ -744,43 +734,52 @@ def sweep(source, load, args, record):
     completed = 0
     source_enabled = False
     load_enabled = False
-
-    if args.startup_voltage is not None:
-        load.set_enabled(False)
-        source.set_voltage(args.startup_voltage)
-        source.set_enabled(True)
-        source_enabled = True
-        startup_started = time.monotonic()
-        source.debug("startup_start", set_v=args.startup_voltage,
-                     source_current_limit_a=args.startup_current,
-                     load_enabled=False, seconds=args.startup_seconds)
-        print(
-            f"Startup: {args.startup_voltage:g} V, source CC limit {args.startup_current:g} A, load OFF "
-            f"for {args.startup_seconds:g} s (excluded from measurement)", flush=True,
-        )
-        deadline = startup_started + args.startup_seconds
-        while time.monotonic() < deadline:
-            # Allow temporary CC during boot, but abort on protection trips or
-            # communication errors. Do not restart or extend the startup phase.
-            try:
-                source.read()
-            except OperatingPointError as error:
-                source.debug("startup_unsettled", error=str(error))
-            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-        source.debug("startup_complete", waited_s=time.monotonic() - startup_started)
-        source.set_current_limit(planned_limits(args)[0])
-
     started = time.monotonic()
 
     def progress():
         # Initially allow for settling checks and serial/control overhead.
-        # Afterwards use actual throughput, including time spent on retries.
+        # Afterwards use actual throughput, including voltage waits and retries.
         return format_progress(
-            completed, total, time.monotonic() - started, args.seconds + args.settle + 2
+            completed, total, time.monotonic() - started,
+            args.seconds + args.settle + 2
+            + (args.voltage_startup_seconds
+               + (0 if args.keep_source_on else args.voltage_shutdown_seconds)) / len(args.currents),
         )
 
     for voltage in args.voltages:
+        if not args.keep_source_on or args.voltage_startup_seconds > 0:
+            load.set_enabled(False)
+            load_enabled = False
+        if not args.keep_source_on:
+            source.set_enabled(False)
+            source_enabled = False
+            source.debug("voltage_shutdown_wait", set_v=voltage, seconds=args.voltage_shutdown_seconds)
+            print(f"Source OFF for {args.voltage_shutdown_seconds:g} s before setting {voltage:g} V", flush=True)
+            time.sleep(args.voltage_shutdown_seconds)
         source.set_voltage(voltage)
+        if args.voltage_startup_seconds > 0:
+            if not source_enabled:
+                source.set_enabled(True)
+                source_enabled = True
+            startup_started = time.monotonic()
+            source.debug("voltage_startup_start", set_v=voltage,
+                         source_current_limit_a=args.source_current_limit,
+                         load_enabled=False, seconds=args.voltage_startup_seconds)
+            print(
+                f"Voltage startup: {voltage:g} V, source CC limit {args.source_current_limit:g} A, load OFF "
+                f"for {args.voltage_startup_seconds:g} s (excluded from measurement)", flush=True,
+            )
+            deadline = startup_started + args.voltage_startup_seconds
+            while time.monotonic() < deadline:
+                # Allow temporary CC during boot, but abort on protection trips
+                # or communication errors without restarting the startup phase.
+                try:
+                    source.read()
+                except OperatingPointError as error:
+                    source.debug("voltage_startup_unsettled", error=str(error))
+                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+            source.debug("voltage_startup_complete", set_v=voltage,
+                         waited_s=time.monotonic() - startup_started)
         for current in args.currents:
             print(
                 f"Measuring flow: source {voltage:g} V -> load {current:g} A ... | {progress()}",
@@ -1035,11 +1034,10 @@ def run(args):
                 voltages=args.voltages,
                 currents=args.currents,
                 source_current_limit=args.source_current_limit,
-                startup_voltage=args.startup_voltage,
-                startup_current=args.startup_current,
-                startup_seconds=args.startup_seconds,
+                voltage_startup_seconds=args.voltage_startup_seconds,
                 debug_serial=args.debug_serial,
                 keep_source_on=args.keep_source_on,
+                voltage_shutdown_seconds=args.voltage_shutdown_seconds,
                 seconds=args.seconds,
                 settle=args.settle,
                 settle_timeout=args.settle_timeout,
@@ -1177,16 +1175,8 @@ def main():
         help="measurement window per point (default 10 s)",
     )
     parser.add_argument(
-        "--startup-voltage", type=parse_setpoint,
-        help="one-time startup supply voltage in V (requires startup current and seconds)",
-    )
-    parser.add_argument(
-        "--startup-current", type=parse_source_current,
-        help="one-time RK6006 startup current limit in A, step 0.001 (load stays OFF)",
-    )
-    parser.add_argument(
-        "--startup-seconds", type=float,
-        help="one-time startup duration, excluded from measurement (no default)",
+        "--voltage-startup-seconds", type=float, default=0,
+        help="source ON duration with load OFF at the start of every voltage cycle (default 0 s; excluded from measurement)",
     )
     parser.add_argument(
         "--debug-serial", action="store_true",
@@ -1195,6 +1185,10 @@ def main():
     parser.add_argument(
         "--keep-source-on", action="store_true",
         help="never send RK6006 OFF, including on errors/Ctrl+C; leave source settings in place",
+    )
+    parser.add_argument(
+        "--voltage-shutdown-seconds", type=float, default=2,
+        help="source OFF duration before every voltage cycle (default 2 s; ignored with --keep-source-on)",
     )
     parser.add_argument(
         "--settle",
@@ -1260,18 +1254,16 @@ def main():
         parser.error("measurement requires explicit --voltages and --currents")
     if not args.probe and args.source_current_limit is None:
         parser.error("measurement requires explicit --source-current-limit; choose it for the DUT input current")
-    startup_values = (args.startup_voltage, args.startup_current, args.startup_seconds)
-    if any(value is not None for value in startup_values):
-        if not all(value is not None for value in startup_values):
-            parser.error("specify --startup-voltage, --startup-current and --startup-seconds together")
-        if args.probe:
-            parser.error("startup options cannot be combined with --probe")
-        if not math.isfinite(args.startup_seconds) or args.startup_seconds <= 0:
-            parser.error("--startup-seconds must be finite and greater than zero")
+    if not math.isfinite(args.voltage_startup_seconds) or args.voltage_startup_seconds < 0:
+        parser.error("--voltage-startup-seconds must be finite and nonnegative")
+    if args.probe and args.voltage_startup_seconds > 0:
+        parser.error("--voltage-startup-seconds cannot be combined with --probe")
     if args.source_port.upper() == args.load_port.upper():
         parser.error("source and load must use different ports")
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         parser.error("--seconds must be finite and greater than zero")
+    if not math.isfinite(args.voltage_shutdown_seconds) or args.voltage_shutdown_seconds <= 0:
+        parser.error("--voltage-shutdown-seconds must be finite and greater than zero")
     if not math.isfinite(args.settle) or args.settle < 0:
         parser.error("--settle must be finite and nonnegative")
     if not math.isfinite(args.settle_timeout) or args.settle_timeout <= args.settle:

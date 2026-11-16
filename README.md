@@ -147,51 +147,51 @@ the supply's available voltage range, current limit and protection limits before
 enabling its output. The selected voltage is the **supply setpoint**;
 current is the **load's CC setpoint**.
 The lists are traversed in the order given: all currents at the first voltage,
-then all currents at the next voltage. Unless a separate startup phase is
-specified, the first voltage and first load current are the starting operating
-point.
+then all currents at the next voltage. Each voltage starts a new cycle.
 
-**The supply and load remain on between points and during point retries.**
-The program changes setpoints without switching the RK6006 output off or
-commanding 0 V. This keeps a device under test powered after its initial start.
+Before setting each new voltage, the program turns the load and RK6006 output
+off, waits **`--voltage-shutdown-seconds` (default 2 seconds)**, then sets the
+voltage. This also applies to the first voltage. It enables the source, waits
+for the optional voltage startup interval with the load OFF, then sets the load
+current and enables the load for measurement. The supply and load remain on
+between currents at the same voltage and during point retries. For example,
+use `--voltage-shutdown-seconds 5` for a five-second OFF interval.
 
 By default, the initial setup switches the outputs off. Completion, Ctrl+C, exhausted
 retries, communication errors or protection trips end the run and trigger
 shutdown. Actual voltage continuity during setpoint changes depends on the
 supply and the connected circuit.
-Use `--keep-source-on` to preserve source power during setup and on exit as
-described below; the load is still shut down.
+Use `--keep-source-on` to change voltages while powered and preserve source
+power during setup and on exit as described below. This skips the OFF intervals;
+the voltage startup intervals still apply, and the load is shut down on exit.
 
 ### Give the device time to start
 
-To start at **12 V with a 0.5 A source current limit for 60 seconds**, then measure each selected
-point for **15 seconds**, specify all three startup options together:
+To let the device start for **60 seconds at every selected voltage**, then
+measure each current point for **15 seconds**, use:
 
 ```powershell
-.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --startup-voltage 12 --startup-current 0.5 --startup-seconds 60 --voltages 3.3 5 --currents 0.1 0.2 0.5 --source-current-limit 0.6 --seconds 15
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --voltage-startup-seconds 60 --voltages 3.3 5 --currents 0.1 0.2 0.5 --source-current-limit 0.6 --seconds 15
 ```
 
-The program sets the RK6006 startup voltage and current limit, enables its
-output and waits for the startup duration. **The ATORCH load remains OFF
-throughout startup.** The program then switches to the measurement current
-limit, sets the first measurement voltage and load current, and enables the
-load without switching the source off. Startup is performed
-**only once per run**, even if a measurement point is retried. It is excluded
-from the CSV points, measured energy and sweep progress/ETA; its settings and
-duration are recorded in `debug.jsonl`.
+At the beginning of **every voltage cycle**, the program sets the selected
+voltage, enables the RK6006 output and waits `--voltage-startup-seconds`.
+**The ATORCH load remains OFF throughout this interval**, including when
+`--keep-source-on` is set. The source current limit is always the required
+`--source-current-limit`, during startup and measurement alike.
 
-Startup voltage uses **0.01 V** steps; `--startup-current` is the **RK6006
-current limit**, in **0.001 A** steps. Both `--startup-current` and the required
-measurement `--source-current-limit` are applied exactly as specified, with no
-automatic margin. OVP/OCP cover both startup and
-measurement settings. The ATORCH cutoff applies only to measurement voltages,
-because its load is off during startup. Communication errors, protection trips or Ctrl+C abort startup
-and trigger shutdown; temporary source CC mode is allowed during startup.
+The startup interval runs once per voltage, including the first voltage. It
+does not repeat for the other currents or point retries at that voltage. It is
+excluded from CSV measurement points and measured energy; sweep elapsed time
+and ETA include the waits. Each interval is recorded in `debug.jsonl`.
+Communication errors, protection trips or Ctrl+C abort startup and trigger
+shutdown; temporary source CC mode is allowed during startup.
 
 After startup, `--settle` (default 2 seconds) and the settling checks apply
 before each point and retry. Increasing `--settle` affects every point;
-`--startup-seconds` affects only the initial startup. Omitting all three startup
-options skips the separate startup phase. They cannot be combined with `--probe`.
+`--voltage-startup-seconds` affects the start of each voltage cycle. Its default
+is **0 seconds**, which skips the startup interval. Positive startup intervals
+cannot be combined with `--probe`.
 
 ### Supply protections
 
@@ -203,7 +203,7 @@ For the 40-point example above, the program temporarily sets:
 | OVP | 22 V |
 | OCP | 2.31 A |
 
-During measurement, the source current limit is exactly the required
+During startup and measurement, the source current limit is exactly the required
 `--source-current-limit` value (0.001 A steps), fixed across the whole sweep.
 It is independent of `--currents`, which controls the load. Choose the source
 limit for the **input current of the device under test**, including its losses
@@ -212,10 +212,8 @@ and the full selected voltage/load range. For a boost converter producing
 would be about 2.67 A. A load-based input limit is therefore inappropriate.
 There is no default source current limit or automatic current margin.
 
-During startup the source limit is exactly `--startup-current`.
-OVP is 110% of the highest selected
-voltage, including startup, and OCP is 110% of the higher of the two source
-current limits. You can specify different
+OVP is 110% of the highest selected voltage, and OCP is 110% of the source
+current limit. You can specify different
 OVP/OCP values with `--ovp` and `--ocp`; they must exceed the selected test
 voltage/current limit and fit the instrument's range.
 
@@ -293,9 +291,10 @@ not remove a systematic measurement error.
 | `--source-port`, `--load-port` | None; both required | Explicitly identify the connected devices |
 | `--list-ports` | Off | List available serial ports and exit without opening them |
 | `--seconds` | 10 | Measure each settled point for longer |
-| `--startup-voltage`, `--startup-current`, `--startup-seconds` | None; all three required together | Run a separate one-time startup phase |
+| `--voltage-startup-seconds` | 0 | Wait with source ON and load OFF at the start of every voltage cycle; nonnegative |
 | `--debug-serial` | Off | Print both ports' raw TX/RX in hex, including identification |
 | `--keep-source-on` | Off | Skip all source OFF commands and source restoration, including on errors/Ctrl+C; still shut down the load |
+| `--voltage-shutdown-seconds` | 2 | Source OFF interval before each voltage cycle; must be positive; ignored with `--keep-source-on` |
 | `--settle` | 2 | Wait longer before checking settling |
 | `--settle-timeout` | 15 | Allow slower settling; must exceed `--settle` |
 | `--point-retries` | 1 | Set `0` to stop on the first rejected window |

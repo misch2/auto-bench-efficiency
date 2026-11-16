@@ -49,9 +49,9 @@ def arguments(**updates):
                   voltages=(5, 9, 12, 15, 20),
                   currents=(0.1, 0.2, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0), seconds=1,
                   settle=0, settle_timeout=15, point_retries=1, output_dir=None, ovp=None, ocp=None,
-                  startup_voltage=None, startup_current=None, startup_seconds=None, debug_serial=False,
+                  voltage_startup_seconds=0, debug_serial=False,
                   source_current_limit=2.1,
-                  keep_source_on=False,
+                  keep_source_on=False, voltage_shutdown_seconds=2,
                   voltage_tolerance=0.05, current_tolerance=0.05)
     values.update(updates)
     return SimpleNamespace(**values)
@@ -250,6 +250,16 @@ class EfficiencyTests(unittest.TestCase):
                          if e["event"] == "atorch_tx" and e["command"] == "0x01"]
         self.assertEqual(load_switches, [1])
 
+    def assert_voltage_changes_power_cycled(self, events, seconds=2):
+        before_shutdown = events[:next(i for i, e in enumerate(events) if e["event"] == "shutdown_start")]
+        off_verified = None
+        for event in before_shutdown:
+            if event["event"] == "rk_verify" and event["address"] == 18:
+                off_verified = event["elapsed_s"] if event["actual"] == 0 else None
+            if event["event"] == "rk_write" and event["address"] == 8:
+                self.assertIsNotNone(off_verified)
+                self.assertGreaterEqual(event["elapsed_s"] - off_verified, seconds - 0.00001)
+
     def test_explicit_source_limit_default_protections_and_restoration(self):
         self.assertEqual(tool.planned_limits(arguments()), (2.1, 22, 2.31))
         settings = self.source.snapshot_settings()
@@ -283,85 +293,87 @@ class EfficiencyTests(unittest.TestCase):
     def test_explicit_limits(self):
         self.assertEqual(tool.planned_limits(arguments(ovp=23, ocp=2.5)), (2.1, 23, 2.5))
 
-    def test_startup_contributes_to_limits_and_range_checks(self):
-        args = arguments(voltages=(3.3, 5), currents=(0.1, 0.2),
-                         source_current_limit=0.3,
-                         startup_voltage=12, startup_current=0.5, startup_seconds=60)
-        self.assertEqual(tool.planned_limits(args), (0.3, 13.2, 0.55))
-        for changes in ({"startup_voltage": 26}, {"startup_current": 6.1}):
+    def test_sweep_limits_and_range_checks(self):
+        args = arguments(voltages=(3.3, 5), currents=(0.1, 0.2), source_current_limit=0.3,
+                         voltage_startup_seconds=60)
+        self.assertEqual(tool.planned_limits(args), (0.3, 5.5, 0.33))
+        for changes in ({"voltages": (26,)}, {"source_current_limit": 6.1}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.source.configure_limits(SimpleNamespace(**(vars(args) | changes)))
         self.assertEqual(self.rig.writes, [])
 
-    def test_startup_once_precedes_sweep_and_is_excluded_from_energy(self):
+    def test_startup_precedes_every_voltage_and_is_excluded_from_energy(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary) / "results"
-            self.run_rig(arguments(output_dir=folder, voltages=(3.3, 5), currents=(0.1, 0.2),
-                                   source_current_limit=0.3,
-                                   seconds=15, startup_voltage=12, startup_current=0.5, startup_seconds=60))
+            self.run_rig(arguments(output_dir=folder, voltages=(9, 5), currents=(0.1, 0.2),
+                                   source_current_limit=0.3, seconds=15,
+                                   voltage_startup_seconds=60, voltage_shutdown_seconds=3.5))
             events = [json.loads(line) for line in (folder / "debug.jsonl").read_text(encoding="utf-8").splitlines()]
             with (folder / "results.csv").open(newline="", encoding="utf-8") as output:
                 points = list(csv.DictReader(output))
-        starts = [e for e in events if e["event"] == "startup_start"]
-        ends = [e for e in events if e["event"] == "startup_complete"]
-        self.assertEqual(len(starts), 1)
-        self.assertEqual(len(ends), 1)
-        self.assertEqual((starts[0]["set_v"], starts[0]["source_current_limit_a"]), (12, 0.5))
-        self.assertFalse(starts[0]["load_enabled"])
-        self.assertAlmostEqual(ends[0]["elapsed_s"] - starts[0]["elapsed_s"], 60)
-        self.assertTrue(all(e["elapsed_s"] >= ends[0]["elapsed_s"] for e in events if e["event"] == "point_start"))
-        boot_reads = [e["registers"] for e in events if e["event"] == "rk_read"
-                      and starts[0]["elapsed_s"] <= e["elapsed_s"] < ends[0]["elapsed_s"]]
-        self.assertTrue(boot_reads)
-        self.assertTrue(all(r[0] == 1200 and r[1] == 0 and r[8] == 1 for r in boot_reads))
-        boot_events = [e for e in events if e["elapsed_s"] < ends[0]["elapsed_s"]]
-        self.assertEqual([e["value"] for e in boot_events
-                          if e["event"] == "rk_write" and e["address"] == 9], [500])
-        self.assertFalse(any(e["event"] == "atorch_tx" and e["command"] == "0x02" for e in boot_events))
-        self.assertTrue(all(bytes.fromhex(e["data_hex"])[3] == 0 for e in boot_events
-                            if e["event"] == "atorch_tx" and e["command"] == "0x01"))
-        measurement_events = events[events.index(ends[0]) + 1:]
-        self.assertEqual(next(e["value"] for e in measurement_events
-                              if e["event"] == "rk_write" and e["address"] == 9), 300)
+        self.assertEqual(events[0]["voltage_startup_seconds"], 60)
+        self.assertEqual(events[0]["voltage_shutdown_seconds"], 3.5)
+        starts = [e for e in events if e["event"] == "voltage_startup_start"]
+        ends = [e for e in events if e["event"] == "voltage_startup_complete"]
+        self.assertEqual([e["set_v"] for e in starts], [9, 5])
+        self.assertEqual([e["set_v"] for e in ends], [9, 5])
+        for first, last in zip(starts, ends):
+            self.assertEqual(first["source_current_limit_a"], 0.3)
+            self.assertFalse(first["load_enabled"])
+            self.assertAlmostEqual(last["elapsed_s"] - first["elapsed_s"], 60)
+            boot_events = events[events.index(first):events.index(last)]
+            boot_reads = [e["registers"] for e in boot_events if e["event"] == "rk_read"]
+            self.assertTrue(boot_reads)
+            self.assertTrue(all(r[0] == first["set_v"] * 100 and r[1] == 0 and r[8] == 1 for r in boot_reads))
+            self.assertFalse(any(e["event"] == "point_start" for e in boot_events))
+            point_starts = [e for e in events if e["event"] == "point_start" and e["set_v"] == first["set_v"]]
+            self.assertTrue(all(e["elapsed_s"] >= last["elapsed_s"] for e in point_starts))
         self.assertEqual(len(points), 4)
         for point in points:
             self.assertEqual(float(point["window_s"]), 15)
             self.assertAlmostEqual(float(point["source_wh"]), float(point["set_v"]) * float(point["set_a"]) * 15 / 3600)
-        self.assert_continuously_powered(events)
+        self.assert_voltage_changes_power_cycled(events, 3.5)
+        waits = [e for e in events if e["event"] == "voltage_shutdown_wait"]
+        self.assertEqual([(e["set_v"], e["seconds"]) for e in waits], [(9, 3.5), (5, 3.5)])
+        self.assertEqual(self.rig.writes.count((18, 1)), 2)
+        # The only current-limit change after configuration is final restoration.
+        self.assertEqual([v for a, v in self.rig.writes if a == 9], [300, 100])
         self.assert_restored()
 
-    def test_startup_current_limit_is_exact_and_independent_of_sweep(self):
-        observed = []
-        real_read = self.rig.instrument.read_registers
+    def test_keep_source_on_skips_shutdown_but_starts_up_at_every_voltage(self):
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "results"
+            self.run_rig(arguments(output_dir=folder, voltages=(9, 5), currents=(0.1, 0.2),
+                                   keep_source_on=True, voltage_shutdown_seconds=20,
+                                   voltage_startup_seconds=2))
+            events = [json.loads(line) for line in (folder / "debug.jsonl").read_text(encoding="utf-8").splitlines()]
+        starts = [e for e in events if e["event"] == "voltage_startup_start"]
+        ends = [e for e in events if e["event"] == "voltage_startup_complete"]
+        self.assertEqual([e["set_v"] for e in starts], [9, 5])
+        for first, last in zip(starts, ends):
+            self.assertAlmostEqual(last["elapsed_s"] - first["elapsed_s"], 2)
+            boot_reads = [e["registers"] for e in events[events.index(first):events.index(last)]
+                          if e["event"] == "rk_read"]
+            self.assertTrue(boot_reads)
+            self.assertTrue(all(r[1] == 0 and r[8] == 1 for r in boot_reads))
+        self.assertFalse(any(e["event"] == "voltage_shutdown_wait" for e in events))
+        self.assertEqual([v for a, v in self.rig.writes if a == 18], [1])
+        self.assertFalse(self.rig.load_on)
 
-        def observe(address, count):
-            if (address, count) == (10, 9):
-                observed.append((self.rig.regs[8], self.rig.regs[9], self.rig.load_on))
-            return real_read(address, count)
+    def test_interrupt_during_shutdown_delay_never_enables_source_or_measures(self):
+        sleep = self.clock.sleep
 
-        with patch.object(self.rig.instrument, "read_registers", side_effect=observe):
-            self.run_rig(arguments(voltages=(5,), currents=(0.5,),
-                                   source_current_limit=0.6,
-                                   startup_voltage=12, startup_current=0.123, startup_seconds=2))
-        boot = [state for state in observed if state[0] == 1200]
-        measurement = [state for state in observed if state[0] == 500]
-        self.assertTrue(boot)
-        self.assertTrue(all(state[1:] == (123, False) for state in boot))
-        self.assertTrue(measurement)
-        self.assertTrue(all(state[1:] == (600, True) for state in measurement))
-        states = [value for address, value in self.rig.writes if address == 18]
-        self.assertEqual(states[states.index(1):], [1, 0])
-        self.assert_restored()
+        def interrupt_delay(seconds):
+            if seconds == 3.5:
+                self.assertEqual(self.rig.regs[18], 0)
+                raise KeyboardInterrupt
+            sleep(seconds)
 
-    def test_load_cutoff_does_not_apply_to_unloaded_startup_voltage(self):
-        query = tool.AtorchLoad.query
-
-        def cutoff(load, command):
-            return 250 if command == 0x18 else query(load, command)
-
-        with patch.object(tool.AtorchLoad, "query", cutoff):
-            self.run_rig(arguments(voltages=(5,), currents=(0.1,),
-                                   startup_voltage=1.8, startup_current=0.5, startup_seconds=2))
+        with patch.object(self.clock, "sleep", side_effect=interrupt_delay), patch.object(tool, "measure_point") as measure:
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_rig(arguments(voltage_shutdown_seconds=3.5))
+        measure.assert_not_called()
+        self.assertNotIn((18, 1), self.rig.writes)
         self.assert_restored()
 
     def test_startup_is_not_repeated_after_rejected_measurement(self):
@@ -377,38 +389,37 @@ class EfficiencyTests(unittest.TestCase):
 
         with TemporaryDirectory() as temporary, patch.object(tool, "measure_point", side_effect=reject_once):
             folder = Path(temporary) / "results"
-            self.run_rig(arguments(output_dir=folder, voltages=(5,), currents=(0.1,),
-                                   startup_voltage=12, startup_current=0.5, startup_seconds=60))
+            self.run_rig(arguments(output_dir=folder, voltages=(5, 9), currents=(0.1,),
+                                   voltage_startup_seconds=60))
             events = [json.loads(line) for line in (folder / "debug.jsonl").read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(calls, 2)
-        self.assertEqual(sum(e["event"] == "startup_start" for e in events), 1)
-        self.assert_continuously_powered(events)
+        self.assertEqual(calls, 3)
+        self.assertEqual(sum(e["event"] == "voltage_startup_start" for e in events), 2)
+        self.assertEqual(self.rig.writes.count((18, 1)), 2)
         self.assert_restored()
 
-    def test_startup_failure_aborts_before_measurement_and_restores(self):
+    def test_later_voltage_startup_failure_stops_before_its_measurement(self):
         real_read = self.rig.instrument.read_registers
 
         def fail_startup(address, count):
-            if (address, count) == (10, 9):
+            if (address, count) == (10, 9) and self.rig.regs[8] == 900 and not self.rig.load_on:
                 raise TimeoutError("startup communication lost")
             return real_read(address, count)
 
-        with patch.object(self.rig.instrument, "read_registers", side_effect=fail_startup), patch.object(tool, "measure_point") as measure:
+        with patch.object(self.rig.instrument, "read_registers", side_effect=fail_startup), patch.object(tool, "measure_point", wraps=tool.measure_point) as measure:
             with self.assertRaisesRegex(TimeoutError, "startup communication lost"):
-                self.run_rig(arguments(startup_voltage=12, startup_current=0.5, startup_seconds=60))
-            measure.assert_not_called()
+                self.run_rig(arguments(voltages=(5, 9), currents=(0.1,), voltage_startup_seconds=60))
+            self.assertEqual(measure.call_count, 1)
         self.assert_restored()
 
     def test_startup_allows_temporary_cc_mode(self):
         real_read = self.rig.instrument.read_registers
 
         def startup_cc(address, count):
-            self.rig.mode = int(self.rig.regs[8] == 1200)
+            self.rig.mode = int(not self.rig.load_on)
             return real_read(address, count)
 
         with patch.object(self.rig.instrument, "read_registers", side_effect=startup_cc):
-            self.run_rig(arguments(voltages=(5,), currents=(0.1,),
-                                   startup_voltage=12, startup_current=0.5, startup_seconds=2))
+            self.run_rig(arguments(voltages=(5, 9), currents=(0.1,), voltage_startup_seconds=2))
         self.assert_restored()
 
     def test_invalid_limits(self):
@@ -889,7 +900,8 @@ class EfficiencyTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "session_end")
             self.assertEqual(events[-1]["status"], "complete")
             self.assertEqual(sum(event["event"] == "point_complete" for event in events), total_points)
-            self.assert_continuously_powered(events)
+            self.assert_voltage_changes_power_cycled(events)
+            self.assertEqual(self.rig.writes.count((18, 1)), len(args.voltages))
             self.assertIn(f"0/{total_points} done, {total_points} left", self.out.getvalue())
             self.assertIn(f"{total_points}/{total_points} done, 0 left", self.out.getvalue())
             self.assertIn("ETA ~0s", self.out.getvalue())
@@ -912,7 +924,7 @@ class EfficiencyTests(unittest.TestCase):
             self.run_rig(arguments(voltages=(12, 5, 9), currents=(0.2, 0.1)))
         self.assertEqual(observed, [(12, 0.2), (12, 0.1), (5, 0.2), (5, 0.1), (9, 0.2), (9, 0.1)])
         states = [value for address, value in self.rig.writes if address == 18]
-        self.assertEqual(states[states.index(1):], [1, 0])
+        self.assertEqual(states[states.index(1):], [1, 0, 1, 0, 1, 0])
         self.assert_restored()
 
     def test_initial_report_timeout_turns_source_off(self):
@@ -1064,7 +1076,7 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(self.rig.regs, self.rig.original)
         self.assertEqual(self.rig.closed, ["source"])
 
-    def test_keep_source_on_startup_interrupt_leaves_startup_settings(self):
+    def test_keep_source_on_startup_interrupt_leaves_cycle_settings(self):
         read = self.rig.instrument.read_registers
 
         def interrupt_startup(address, count):
@@ -1075,9 +1087,9 @@ class EfficiencyTests(unittest.TestCase):
         with patch.object(self.rig.instrument, "read_registers", side_effect=interrupt_startup):
             with self.assertRaises(KeyboardInterrupt):
                 self.run_rig(arguments(keep_source_on=True, voltages=(5,), currents=(0.1,), source_current_limit=1,
-                                       startup_voltage=12, startup_current=0.5, startup_seconds=60))
+                                       voltage_startup_seconds=60))
         self.assertNotIn((18, 0), self.rig.writes)
-        self.assertEqual(self.rig.regs, {8: 1200, 9: 500, 82: 1320, 83: 1100, 18: 1})
+        self.assertEqual(self.rig.regs, {8: 500, 9: 1000, 82: 550, 83: 1100, 18: 1})
         self.assertFalse(self.rig.load_on)
 
     def test_keep_source_on_lowers_protections_after_setting_new_operating_point(self):
@@ -1224,6 +1236,9 @@ class EfficiencyTests(unittest.TestCase):
         for option in (["--ovp", "5"], ["--ocp", "0.15"],
                        ["--current-tolerance", "nan"], ["--voltage-tolerance", "1"],
                        ["--settle-timeout", "nan"], ["--settle-timeout", "2"],
+                       *[["--voltage-shutdown-seconds", value] for value in ("0", "-1", "nan", "inf")],
+                       *[["--voltage-startup-seconds", value] for value in ("-1", "nan", "inf")],
+                       ["--voltage-startup-seconds", "1", "--probe"],
                        ["--point-retries", "-1"]):
             with self.subTest(option=option), patch.object(sys, "argv", command_line(["--voltages", "5", "--currents", "0.1"] + option)), patch.object(tool, "run") as run:
                 with self.assertRaises(SystemExit) as stopped:
@@ -1231,27 +1246,29 @@ class EfficiencyTests(unittest.TestCase):
                 self.assertEqual(stopped.exception.code, 2)
                 run.assert_not_called()
 
-    def test_startup_cli_requires_complete_valid_group(self):
-        startup = ["--startup-voltage", "12", "--startup-current", "0.5", "--startup-seconds", "60"]
-        invalid = [startup[:2], startup[2:4], startup[4:], startup[:4], startup[:2] + startup[4:], startup[2:]]
-        invalid += [startup[:-1] + [value] for value in ("0", "-1", "nan", "inf")]
-        invalid += [startup + ["--probe"], startup + ["--ovp", "6"], startup + ["--ocp", "0.5"]]
-        for options in invalid:
-            with self.subTest(options=options), patch.object(sys, "argv", command_line(["--voltages", "3.3", "--currents", "0.1"] + options)), patch.object(tool, "run") as run:
+    def test_removed_cli_options_are_rejected(self):
+        for option in ("--startup-voltage", "--startup-current", "--startup-seconds", "--source-off-seconds"):
+            with self.subTest(option=option), patch.object(sys, "argv", command_line(["--voltages", "5", "--currents", "0.1", option, "1"])), patch.object(tool, "run") as run:
                 with self.assertRaises(SystemExit) as stopped:
                     tool.main()
                 self.assertEqual(stopped.exception.code, 2)
                 run.assert_not_called()
 
-    def test_cli_accepts_startup_and_serial_debug(self):
+    def test_cli_accepts_voltage_timing_and_serial_debug(self):
         options = command_line(["--voltages", "3.3", "5", "--currents", "0.1", "--seconds", "15",
-                   "--startup-voltage", "12", "--startup-current", "0.123", "--startup-seconds", "60", "--debug-serial", "--keep-source-on"])
+                   "--voltage-startup-seconds", "60", "--debug-serial", "--keep-source-on", "--voltage-shutdown-seconds", "3.5"])
         with patch.object(sys, "argv", options), patch.object(tool, "run") as run:
             self.assertEqual(tool.main(), 0)
         args = run.call_args.args[0]
-        self.assertEqual((args.startup_voltage, args.startup_current, args.startup_seconds, args.seconds), (12, 0.123, 60, 15))
+        self.assertEqual((args.voltage_startup_seconds, args.voltage_shutdown_seconds, args.seconds), (60, 3.5, 15))
         self.assertTrue(args.debug_serial)
         self.assertTrue(args.keep_source_on)
+
+    def test_cli_voltage_timing_defaults_disable_startup(self):
+        with patch.object(sys, "argv", command_line(["--voltages", "5", "--currents", "0.1"])), patch.object(tool, "run") as run:
+            self.assertEqual(tool.main(), 0)
+        args = run.call_args.args[0]
+        self.assertEqual((args.voltage_startup_seconds, args.voltage_shutdown_seconds), (0, 2))
 
     def test_serial_trace_preserves_bytes_and_forwards_configuration(self):
         output = StringIO()

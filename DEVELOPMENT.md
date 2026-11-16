@@ -38,13 +38,25 @@ the actual queried value/state to match. Unexpected framed data before a new
 request still invalidates synchronization, and timeouts still block later
 requests, preventing a late data reply from being used for another query.
 
-`--keep-source-on` skips source OFF in initialization, limit configuration and
-cleanup, and skips all source restoration writes. Load shutdown remains active.
+`--keep-source-on` skips source OFF in initialization, limit configuration,
+voltage cycles and cleanup, and skips all source restoration writes. Load shutdown remains active.
 For live configuration, higher existing OVP/OCP thresholds are retained until
 the new voltage/current settings are applied, then the requested protections
 are written. Regression tests cover normal completion, communication/operating
 errors, Ctrl+C in measurement and startup, early load-open failure and lowering
 live protections. Hardware protection trips are never automatically re-enabled.
+
+Without `--keep-source-on`, voltage transitions turn the load and source OFF,
+verify source OFF, wait `--voltage-shutdown-seconds` (default 2 s), then write
+the new voltage, including the first cycle. Each voltage cycle then waits
+`--voltage-startup-seconds` (default 0 s) with source ON and load OFF before
+starting current measurements. Startup uses the same source current limit as
+measurement. Current changes and point retries preserve source power and do
+not repeat either interval. Startup still runs with `--keep-source-on`, with
+the load OFF while the source remains powered.
+Offline checks cover interval ordering and durations, multiple voltages and
+currents, energy exclusion, retries, keep-on behavior, interruption during both
+intervals and communication failure in a later voltage's startup.
 
 The `RK6006-Python-Module` submodule points to
 [`dzwer/RK6006-Python-Module`](https://github.com/dzwer/RK6006-Python-Module),
