@@ -13,13 +13,12 @@ import sys
 import time
 
 TOOLS = Path(__file__).resolve().parent
-VOLTAGES = (5, 9, 12, 15, 20)
-CURRENTS = (0.1, 0.2, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
 ATORCH_REPORT = b"\xff\x55\x01\x02"
 PX100_REPLY = b"\xca\xcb"
 PX100_ACK = b"\x6f"
 PX100_REQUEST_GAP = 0.05
 PX100_REPLY_TIMEOUT = 1.0
+ATORCH_REPORT_IDLE_TIMEOUT = 0.1
 
 
 def no_debug(event, **details):
@@ -74,6 +73,67 @@ class OperatingPointError(RuntimeError):
     """Readable measurements have not reached the requested operating point."""
 
 
+class SerialTrace:
+    """Trace the actual transport, including RK6006's identification request."""
+
+    def __init__(self, port, label, debug=no_debug):
+        object.__setattr__(self, "_port", port)
+        object.__setattr__(self, "_label", label)
+        object.__setattr__(self, "_debug", debug)
+        object.__setattr__(self, "_console_failed", False)
+
+    def __getattr__(self, name):
+        return getattr(self._port, name)
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._port, name, value)
+
+    def trace(self, event, direction, data=b"", **details):
+        self._debug(
+            event, instrument=self._label, port=self.port,
+            baudrate=self.baudrate, data_hex=data.hex(" "), **details,
+        )
+        if self._console_failed:
+            return
+        message = data.hex(" ") or "<no data>"
+        if details:
+            message += " | " + ", ".join(f"{key}={value}" for key, value in details.items())
+        try:
+            print(
+                f"[{time.monotonic():.3f}] {self._label} {self.port} "
+                f"({self.baudrate} baud) {direction}: {message}",
+                file=sys.stderr, flush=True,
+            )
+        except (OSError, ValueError):
+            # A closed console must not prevent an emergency OFF command.
+            self._console_failed = True
+
+    def write(self, data):
+        self.trace("serial_tx", "TX", bytes(data))
+        try:
+            count = self._port.write(data)
+        except (Exception, KeyboardInterrupt) as error:
+            self.trace("serial_error", "TX ERROR", error=str(error))
+            raise
+        self._debug("serial_written", instrument=self._label, port=self.port,
+                    bytes=count, expected_bytes=len(data))
+        if count != len(data):
+            self.trace("serial_partial_write", "TX PARTIAL", bytes=count, expected_bytes=len(data))
+        return count
+
+    def read(self, count=1):
+        try:
+            data = self._port.read(count)
+        except (Exception, KeyboardInterrupt) as error:
+            self.trace("serial_error", "RX ERROR", requested_bytes=count, error=str(error))
+            raise
+        self.trace("serial_rx", "RX", bytes(data), requested_bytes=count)
+        return data
+
+
 class RKSource:
     def __init__(self, module, debug=no_debug):
         self.module = module
@@ -110,24 +170,39 @@ class RKSource:
 
     def configure_limits(self, args):
         current_limit, ovp, ocp = planned_limits(args)
+        voltages = operating_voltages(args)
         if (
-            current_limit > self.module.max_set_current
+            max(current_limit, args.startup_current or 0) > self.module.max_set_current
             or ocp > self.module.max_ocp_current
         ):
             raise ValueError("Requested current limit or OCP exceeds the RK6006 range")
         if (
-            max(args.voltages) > self.module.max_set_voltage
+            max(voltages) > self.module.max_set_voltage
             or ovp > self.module.max_set_voltage + 2
         ):
             raise ValueError(
                 "RK6006 input voltage is too low for the requested voltage/OVP"
             )
-        self.set_enabled(False)
-        self.write_verified(82, round(ovp * self.volts_resolution))
-        self.write_verified(83, round(ocp * self.amps_resolution))
-        self.set_current_limit(current_limit)
+        initial_current_limit = args.startup_current if args.startup_current is not None else current_limit
+        ovp_register = round(ovp * self.volts_resolution)
+        ocp_register = round(ocp * self.amps_resolution)
+        if args.keep_source_on:
+            # Keep existing higher protections until the new operating point
+            # is set, so lowering OVP below the old voltage does not trip OFF.
+            previous_ovp, previous_ocp = self.instrument.read_registers(82, 2)
+            self.write_verified(82, max(previous_ovp, ovp_register))
+            self.write_verified(83, max(previous_ocp, ocp_register))
+            self.set_current_limit(initial_current_limit)
+            self.set_voltage(args.startup_voltage if args.startup_voltage is not None else args.voltages[0])
+        else:
+            self.set_enabled(False)
+        self.write_verified(82, ovp_register)
+        self.write_verified(83, ocp_register)
+        if not args.keep_source_on:
+            self.set_current_limit(initial_current_limit)
         print(
-            f"RK6006 sweep limits: CC {current_limit:g} A, OVP {ovp:g} V, OCP {ocp:g} A",
+            f"RK6006 sweep limits: CC {current_limit:g} A, OVP {ovp:g} V, OCP {ocp:g} A"
+            + (f"; startup CC {args.startup_current:g} A" if args.startup_current is not None else ""),
             flush=True,
         )
 
@@ -142,7 +217,9 @@ class RKSource:
             )
         if mode != 0:
             raise OperatingPointError(
-                f"RK6006 is not in CV mode (mode={mode}); measurement rejected"
+                f"RK6006 is not in CV mode (mode={mode}); measurement rejected. "
+                f"RK6006 {voltage / self.volts_resolution:.3f} V / "
+                f"{current / self.amps_resolution:.3f} A"
             )
         return voltage / self.volts_resolution, current / self.amps_resolution
 
@@ -216,15 +293,56 @@ class AtorchLoad:
             del self.buffer[0]
         return None
 
+    def recover_stalled_report(self, prefix, idle_s):
+        """Recover a reply suffix after a stalled, incomplete telemetry frame.
+
+        Some DL24P replies terminate an unsolicited report mid-frame. Wait for
+        an idle gap before treating it as interrupted; never inspect inside a
+        complete, checksum-validated report. ACK is only a hint: both callers
+        of write commands still verify the actual setting with a separate query.
+        """
+        if idle_s < ATORCH_REPORT_IDLE_TIMEOUT:
+            return False
+        if not self.buffer.startswith(ATORCH_REPORT) or len(self.buffer) >= 36:
+            return False
+        if prefix == PX100_ACK and self.buffer.endswith(PX100_ACK):
+            size = 1
+        elif (
+            prefix == PX100_REPLY
+            and len(self.buffer) >= len(ATORCH_REPORT) + 7
+            and self.buffer[-7:-5] == PX100_REPLY
+            and self.buffer[-2:] == b"\xce\xcf"
+        ):
+            size = 7
+        else:
+            return False
+        self.debug(
+            "atorch_report_interrupted", idle_s=idle_s,
+            discarded_hex=self.buffer[:-size].hex(" "),
+            recovered_hex=self.buffer[-size:].hex(" "),
+        )
+        del self.buffer[:-size]
+        return True
+
     def receive(self, prefix, timeout):
         deadline = time.monotonic() + timeout
+        last_data_at = time.monotonic()
         while time.monotonic() < deadline:
             frame = self.pop_frame()
             if frame is None:
                 available = min(self.port.in_waiting, 256)
-                self.buffer.extend(self.read_bytes(available or 1))
+                data = self.read_bytes(available or 1)
+                if data:
+                    self.buffer.extend(data)
+                    last_data_at = time.monotonic()
+                else:
+                    self.recover_stalled_report(prefix, time.monotonic() - last_data_at)
             elif frame.startswith(prefix):
                 return frame
+            elif prefix == PX100_REPLY and frame == PX100_ACK:
+                # An extra/delayed write ACK carries no reading. Continue to
+                # wait for the data frame without extending this deadline.
+                self.debug("atorch_ack_ignored", phase="waiting_for_data")
             elif prefix != ATORCH_REPORT and not frame.startswith(ATORCH_REPORT):
                 raise RuntimeError(
                     "ATORCH unexpected PX100 reply; synchronization lost"
@@ -244,6 +362,11 @@ class AtorchLoad:
             if available:
                 self.buffer.extend(self.read_bytes(available))
             while (frame := self.pop_frame()) is not None:
+                if frame == PX100_ACK:
+                    # A leftover ACK cannot identify any setting. Drop it;
+                    # setters still require a fresh readback after their write.
+                    self.debug("atorch_ack_ignored", phase="before_request", command=f"0x{command:02x}")
+                    continue
                 if not frame.startswith(ATORCH_REPORT):
                     raise RuntimeError(
                         "ATORCH stale PX100 reply before request; synchronization lost"
@@ -333,17 +456,26 @@ class Point:
     attempts: int = 1
 
 
+def operating_voltages(args):
+    voltages = tuple(args.voltages)
+    if args.startup_voltage is not None:
+        voltages += (args.startup_voltage,)
+    return voltages
+
+
 def planned_limits(args):
-    current_limit = round(max(args.currents) + 0.1, 3)
-    ovp = round(args.ovp if args.ovp is not None else max(args.voltages) * 1.1, 2)
-    ocp = round(args.ocp if args.ocp is not None else current_limit * 1.1, 3)
-    if not math.isfinite(ovp) or ovp <= max(args.voltages):
+    voltages = operating_voltages(args)
+    current_limit = args.source_current_limit
+    highest_current_limit = max(current_limit, args.startup_current or 0)
+    ovp = round(args.ovp if args.ovp is not None else max(voltages) * 1.1, 2)
+    ocp = round(args.ocp if args.ocp is not None else highest_current_limit * 1.1, 3)
+    if not math.isfinite(ovp) or ovp <= max(voltages):
         raise ValueError(
-            "--ovp must exceed the highest test voltage (at 0.01 V resolution)"
+            "--ovp must exceed the highest test/startup voltage (at 0.01 V resolution)"
         )
-    if not math.isfinite(ocp) or ocp <= current_limit:
+    if not math.isfinite(ocp) or ocp <= highest_current_limit:
         raise ValueError(
-            "--ocp must exceed the source current limit (at 0.001 A resolution)"
+            "--ocp must exceed both source current limits (at 0.001 A resolution)"
         )
     return current_limit, ovp, ocp
 
@@ -358,7 +490,20 @@ def sample_pair(
     phase="measurement",
 ):
     before = time.monotonic()
-    source_v, source_a = source.read()
+    allowed_v = max(0.1, voltage * voltage_tolerance)
+    allowed_a = max(0.01, current * current_tolerance)
+    targets = (
+        f"Requested source {voltage:g} V +/- {allowed_v:g} V; "
+        f"load {current:g} A +/- {allowed_a:g} A"
+    )
+    try:
+        source_v, source_a = source.read()
+    except OperatingPointError as error:
+        load_v, load_a = load.read()
+        message = f"{error}; ATORCH {load_v:.3f} V / {load_a:.3f} A. {targets}"
+        source.debug("sample_rejected", phase=phase, error=message,
+                     load_v=load_v, load_a=load_a)
+        raise OperatingPointError(message) from error
     load_v, load_a = load.read()
     after = time.monotonic()
     source.debug(
@@ -372,23 +517,32 @@ def sample_pair(
         load_a=load_a,
         read_duration_s=after - before,
     )
-    if not all(
-        math.isfinite(value) and value > 0
-        for value in (source_v, source_a, load_v, load_a)
-    ):
+    readings = (
+        f"RK6006 {source_v:.3f} V / {source_a:.3f} A; "
+        f"ATORCH {load_v:.3f} V / {load_a:.3f} A"
+    )
+    invalid = [
+        f"{label}={value:g} {unit}"
+        for label, value, unit in (
+            ("source voltage", source_v, "V"), ("source current", source_a, "A"),
+            ("load voltage", load_v, "V"), ("load current", load_a, "A"),
+        )
+        if not math.isfinite(value) or value <= 0
+    ]
+    if invalid:
         raise OperatingPointError(
-            "Invalid or missing voltage/current; measurement rejected"
+            "Invalid or missing voltage/current; measurement rejected. "
+            f"Must be finite and > 0: {', '.join(invalid)}. {readings}. {targets}"
         )
     for label, measured, target, tolerance in (
-        ("source voltage", source_v, voltage, max(0.1, voltage * voltage_tolerance)),
-        ("load current", load_a, current, max(0.01, current * current_tolerance)),
+        ("source voltage", source_v, voltage, allowed_v),
+        ("load current", load_a, current, allowed_a),
     ):
         if abs(measured - target) > tolerance:
             raise OperatingPointError(
                 f"Wrong {label}: measured {measured:g}, expected {target:g} "
                 f"+/- {tolerance:g}; measurement rejected. "
-                f"RK6006 {source_v:.3f} V / {source_a:.3f} A; "
-                f"ATORCH {load_v:.3f} V / {load_a:.3f} A"
+                f"{readings}"
             )
     values = (source_v, source_a, source_v * source_a, load_v, load_a, load_v * load_a)
     return (before + after) / 2, values
@@ -419,7 +573,11 @@ def wait_for_settle(source, load, voltage, current, args):
             source.debug("settling_rejected", error=str(error))
         else:
             consecutive += 1
-            last_status = f"Only {consecutive}/3 consecutive readings in tolerance"
+            last_status = (
+                f"Only {consecutive}/3 consecutive readings in tolerance. "
+                f"RK6006 {values[0]:.3f} V / {values[1]:.3f} A; "
+                f"ATORCH {values[3]:.3f} V / {values[4]:.3f} A"
+            )
             if time.monotonic() <= deadline and consecutive >= 3:
                 print(
                     f"  Settled after {time.monotonic() - started:.1f} s "
@@ -503,13 +661,17 @@ def measure_point(
     )
 
 
-def shutdown(source, load, settings=None):
+def shutdown(source, load, settings=None, *, keep_source_on=False):
     problems = []
     source_off = False
     debug = source.debug if source is not None else no_debug
-    debug("shutdown_start", restoring_settings=settings is not None)
+    debug("shutdown_start", restoring_settings=settings is not None and not keep_source_on,
+          keep_source_on=keep_source_on)
+    if keep_source_on:
+        debug("rk_shutdown_skipped", reason="keep_source_on")
+        print("RK6006: OFF and settings restoration skipped (--keep-source-on).", flush=True)
     for label, instrument in (("RK6006", source), ("ATORCH", load)):
-        if instrument is None:
+        if instrument is None or (instrument is source and keep_source_on):
             continue
         try:
             instrument.set_enabled(False)
@@ -518,7 +680,7 @@ def shutdown(source, load, settings=None):
         except (Exception, KeyboardInterrupt) as error:
             problems.append(f"{label} OFF could not be verified: {error}")
             debug("shutdown_error", instrument=label, error=str(error))
-    if settings is not None:
+    if settings is not None and not keep_source_on:
         if source_off:
             for address, value in settings.items():
                 try:
@@ -561,6 +723,34 @@ def sweep(source, load, args, record):
     source.configure_limits(args)
     total = len(args.voltages) * len(args.currents)
     completed = 0
+    source_enabled = False
+    load_enabled = False
+
+    if args.startup_voltage is not None:
+        load.set_enabled(False)
+        source.set_voltage(args.startup_voltage)
+        source.set_enabled(True)
+        source_enabled = True
+        startup_started = time.monotonic()
+        source.debug("startup_start", set_v=args.startup_voltage,
+                     source_current_limit_a=args.startup_current,
+                     load_enabled=False, seconds=args.startup_seconds)
+        print(
+            f"Startup: {args.startup_voltage:g} V, source CC limit {args.startup_current:g} A, load OFF "
+            f"for {args.startup_seconds:g} s (excluded from measurement)", flush=True,
+        )
+        deadline = startup_started + args.startup_seconds
+        while time.monotonic() < deadline:
+            # Allow temporary CC during boot, but abort on protection trips or
+            # communication errors. Do not restart or extend the startup phase.
+            try:
+                source.read()
+            except OperatingPointError as error:
+                source.debug("startup_unsettled", error=str(error))
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+        source.debug("startup_complete", waited_s=time.monotonic() - startup_started)
+        source.set_current_limit(planned_limits(args)[0])
+
     started = time.monotonic()
 
     def progress():
@@ -574,7 +764,7 @@ def sweep(source, load, args, record):
         source.set_voltage(voltage)
         for current in args.currents:
             print(
-                f"Measuring {voltage:g} V / {current:g} A ... | {progress()}",
+                f"Measuring flow: source {voltage:g} V -> load {current:g} A ... | {progress()}",
                 flush=True,
             )
             for attempt in range(1, args.point_retries + 2):
@@ -584,8 +774,12 @@ def sweep(source, load, args, record):
                 )
                 try:
                     load.set_current(current)
-                    source.set_enabled(True)
-                    load.set_enabled(True)
+                    if not source_enabled:
+                        source.set_enabled(True)
+                        source_enabled = True
+                    if not load_enabled:
+                        load.set_enabled(True)
+                        load_enabled = True
                     wait_for_settle(source, load, voltage, current, args)
                     point = measure_point(
                         source,
@@ -606,9 +800,8 @@ def sweep(source, load, args, record):
                     )
                     if attempt > args.point_retries:
                         raise
-                    # Reject the complete window, turn off and start a fresh
-                    # settled window. Never splice around an anomalous sample.
-                    shutdown(source, load)
+                    # Keep the DUT powered while starting a fresh settled
+                    # window. Never splice around an anomalous sample.
                     print(f"  Point rejected: {error}", flush=True)
                     print(
                         f"  Repeating complete point (retry {attempt}/{args.point_retries}) ... "
@@ -616,7 +809,6 @@ def sweep(source, load, args, record):
                         flush=True,
                     )
                     continue
-                shutdown(source, load)
                 point = replace(point, attempts=attempt)
                 record(point)
                 completed += 1
@@ -823,6 +1015,12 @@ def run(args):
                 load_port=args.load_port,
                 voltages=args.voltages,
                 currents=args.currents,
+                source_current_limit=args.source_current_limit,
+                startup_voltage=args.startup_voltage,
+                startup_current=args.startup_current,
+                startup_seconds=args.startup_seconds,
+                debug_serial=args.debug_serial,
+                keep_source_on=args.keep_source_on,
                 seconds=args.seconds,
                 settle=args.settle,
                 settle_timeout=args.settle_timeout,
@@ -833,16 +1031,26 @@ def run(args):
                 ocp=args.ocp,
             )
         debug("source_connect", port=args.source_port)
+        # Own the transport before identification so even the very first
+        # Modbus exchange is traced, and a failed constructor closes its port.
+        source_port = serial.Serial(args.source_port, 115200, timeout=0.5, write_timeout=0.5)
+        stack.callback(source_port.close)
+        if args.debug_serial:
+            source_port = SerialTrace(source_port, "RK6006", debug)
         try:
-            module = RK6006(args.source_port)
+            module = RK6006(source_port)
         except SystemExit as error:
             raise RuntimeError(f"Expected an RK6006 on {args.source_port}") from error
-        stack.callback(module.instrument.serial.close)
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not identify RK6006 on {args.source_port} "
+                f"(115200 baud, Modbus address 1): {error}"
+            ) from error
         source = RKSource(module, debug)
         load = None
         settings = None
         try:
-            if not args.probe:
+            if not args.probe and not args.keep_source_on:
                 # The source is already identified: turn it off before opening
                 # or probing the load, which may fail or take several seconds.
                 source.set_enabled(False)
@@ -858,6 +1066,8 @@ def run(args):
             port = stack.enter_context(
                 serial.Serial(args.load_port, 9600, timeout=0.05, write_timeout=0.5)
             )
+            if args.debug_serial:
+                port = SerialTrace(port, "ATORCH", debug)
             candidate = AtorchLoad(port, debug)
             candidate.receive(ATORCH_REPORT, 4)
             debug("load_identified", port=args.load_port)
@@ -895,7 +1105,7 @@ def run(args):
             if not args.probe:
                 failed = sys.exc_info()[0] is not None
                 try:
-                    shutdown(source, load, settings)
+                    shutdown(source, load, settings, keep_source_on=args.keep_source_on)
                 except RuntimeError as error:
                     if not failed:
                         raise
@@ -904,25 +1114,68 @@ def run(args):
                     print(f"Check the equipment manually. {error}", file=sys.stderr)
 
 
+def parse_setpoint(value, decimals=2):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("setpoint must be finite and greater than zero")
+    if number != round(number, decimals):
+        raise argparse.ArgumentTypeError(f"setpoint must use a {10 ** -decimals:g} step")
+    return number
+
+
+def parse_source_current(value):
+    return parse_setpoint(value, decimals=3)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--source-port", default="COM3", help="RK6006 port (default COM3)"
+        "--source-port", help="RK6006 port (required for measurement and probe; no default)"
     )
     parser.add_argument(
-        "--load-port", default="COM4", help="ATORCH port (default COM4)"
+        "--load-port", help="ATORCH port (required for measurement and probe; no default)"
     )
     parser.add_argument(
-        "--voltages", type=float, nargs="+", choices=VOLTAGES, default=VOLTAGES
+        "--list-ports", action="store_true",
+        help="list available serial ports without opening them, then exit",
     )
     parser.add_argument(
-        "--currents", type=float, nargs="+", choices=CURRENTS, default=CURRENTS
+        "--voltages", type=parse_setpoint, nargs="+",
+        help="positive supply voltages in V, step 0.01 (required for measurement; no default)",
+    )
+    parser.add_argument(
+        "--currents", type=parse_setpoint, nargs="+",
+        help="positive load currents in A, step 0.01 (required for measurement; no default)",
+    )
+    parser.add_argument(
+        "--source-current-limit", type=parse_source_current,
+        help="RK6006 measurement current limit in A, step 0.001 (required for measurement; no default)",
     )
     parser.add_argument(
         "--seconds",
         type=float,
         default=10,
         help="measurement window per point (default 10 s)",
+    )
+    parser.add_argument(
+        "--startup-voltage", type=parse_setpoint,
+        help="one-time startup supply voltage in V (requires startup current and seconds)",
+    )
+    parser.add_argument(
+        "--startup-current", type=parse_source_current,
+        help="one-time RK6006 startup current limit in A, step 0.001 (load stays OFF)",
+    )
+    parser.add_argument(
+        "--startup-seconds", type=float,
+        help="one-time startup duration, excluded from measurement (no default)",
+    )
+    parser.add_argument(
+        "--debug-serial", action="store_true",
+        help="print hex TX/RX for both serial ports, including initial identification",
+    )
+    parser.add_argument(
+        "--keep-source-on", action="store_true",
+        help="never send RK6006 OFF, including on errors/Ctrl+C; leave source settings in place",
     )
     parser.add_argument(
         "--settle",
@@ -973,6 +1226,29 @@ def main():
         help="identify both devices and query readings without changing settings",
     )
     args = parser.parse_args()
+    if args.list_ports:
+        from serial.tools.list_ports import comports
+
+        ports = sorted(comports(), key=lambda port: port.device)
+        if not ports:
+            print("No serial ports found.")
+        for port in ports:
+            print(f"{port.device}: {port.description}")
+        return 0
+    if not args.source_port or not args.load_port:
+        parser.error("specify --source-port and --load-port explicitly; use --list-ports to see available ports")
+    if not args.probe and (args.voltages is None or args.currents is None):
+        parser.error("measurement requires explicit --voltages and --currents")
+    if not args.probe and args.source_current_limit is None:
+        parser.error("measurement requires explicit --source-current-limit; choose it for the DUT input current")
+    startup_values = (args.startup_voltage, args.startup_current, args.startup_seconds)
+    if any(value is not None for value in startup_values):
+        if not all(value is not None for value in startup_values):
+            parser.error("specify --startup-voltage, --startup-current and --startup-seconds together")
+        if args.probe:
+            parser.error("startup options cannot be combined with --probe")
+        if not math.isfinite(args.startup_seconds) or args.startup_seconds <= 0:
+            parser.error("--startup-seconds must be finite and greater than zero")
     if args.source_port.upper() == args.load_port.upper():
         parser.error("source and load must use different ports")
     if not math.isfinite(args.seconds) or args.seconds <= 0:
@@ -983,20 +1259,21 @@ def main():
         parser.error("--settle-timeout must be finite and greater than --settle")
     if args.point_retries < 0:
         parser.error("--point-retries must be nonnegative")
-    if len(set(args.voltages)) != len(args.voltages) or len(set(args.currents)) != len(
-        args.currents
-    ):
-        parser.error("voltage and current setpoints must be unique")
+    for name in ("voltages", "currents"):
+        values = getattr(args, name)
+        if values is not None and len(set(values)) != len(values):
+            parser.error("voltage and current setpoints must be unique")
     for name in ("voltage_tolerance", "current_tolerance"):
         value = getattr(args, name)
         if not math.isfinite(value) or not 0 <= value < 1:
             parser.error(
                 f"--{name.replace('_', '-')} must be finite and in the range [0, 1)"
             )
-    try:
-        planned_limits(args)
-    except ValueError as error:
-        parser.error(str(error))
+    if not args.probe:
+        try:
+            planned_limits(args)
+        except ValueError as error:
+            parser.error(str(error))
 
     try:
         run(args)

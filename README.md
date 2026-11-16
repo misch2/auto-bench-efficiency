@@ -33,8 +33,11 @@ Set the ATORCH locally to **CC (constant current)**. Set its voltage cutoff
 below the lowest voltage expected at its terminals. This program checks the
 cutoff but does not select the load mode for you.
 
-The default test reaches **20 V and 2 A, or 40 W**. Check the connected circuit,
-leads and load cooling before using the full test. If you insert an ammeter,
+There are **no default test voltages, load currents or source current limit**.
+Every measurement command must explicitly include `--voltages`, `--currents`
+and `--source-current-limit`; they are read only from the command line.
+Check the connected circuit,
+leads and load cooling against every selected point. If you insert an ammeter,
 its input and range must cover the whole selected test, not just its first point.
 
 Both devices may share a return path through the computer's USB connections.
@@ -68,14 +71,21 @@ Open **Device Manager → Ports (COM & LPT)**. Both devices commonly appear as
 USB-SERIAL CH340, so the displayed name alone does not distinguish them.
 Disconnect and reconnect one USB cable at a time to identify the port number.
 
-The defaults are **COM3 for RK6006** and **COM4 for ATORCH**. Replace these in
-the commands if your computer assigns different numbers. Close other programs
-using either port.
+List the ports currently available on the computer without opening them:
+
+```powershell
+.\.venv\Scripts\python.exe .\measure_efficiency.py --list-ports
+```
+
+There are **no default COM ports**. Both `--source-port` and `--load-port` must
+be specified for measurement and `--probe`. The commands below use **COM4 for
+RK6006** and **COM3 for ATORCH as examples only**; replace them with the ports
+you identified. Close other programs using either port.
 
 First check communication:
 
 ```powershell
-.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM3 --load-port COM4 --probe
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --probe
 ```
 
 This displays the identified supply, input voltage, OVP/OCP, load readings and
@@ -86,12 +96,12 @@ cutoff. **`--probe` does not change settings or output states.**
 For a direct connection that can accept 5 V:
 
 ```powershell
-.\.venv\Scripts\python.exe .\measure_efficiency.py --voltages 5 --currents 0.1 --seconds 10
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --voltages 5 --currents 0.1 --source-current-limit 0.2 --seconds 10
 ```
 
-The program turns the identified instruments off, configures the test, turns
-them on and waits for acceptable readings. Once settled, it measures for the
-requested 10 seconds and turns both outputs off.
+By default, the program turns the identified instruments off, configures the test, turns
+them on once and waits for acceptable readings. Once settled, it measures for
+the requested 10 seconds and turns both outputs off at the end of the run.
 
 Watch the instruments during the first test. Press **Ctrl+C** to stop. If the
 program reports that OFF could not be verified, switch the equipment off locally.
@@ -99,13 +109,13 @@ A disconnected serial cable prevents the computer from confirming shutdown.
 
 ## Run a sweep
 
-With the default COM ports:
+Explicitly select both ports and every desired voltage and current:
 
 ```powershell
-.\.venv\Scripts\python.exe .\measure_efficiency.py
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --voltages 5 9 12 15 20 --currents 0.1 0.2 0.25 0.5 0.75 1 1.5 2 --source-current-limit 2.1
 ```
 
-The default sweep has **40 points**:
+This example sweep has **40 points** and reaches **20 V and 2 A, or 40 W**:
 
 | Setting | Values |
 | --- | --- |
@@ -121,31 +131,114 @@ observed test speed. Time spent on repeated attempts is included.
 To select a smaller part of the sweep:
 
 ```powershell
-.\.venv\Scripts\python.exe .\measure_efficiency.py --voltages 9 12 --currents 0.5 1 2 --seconds 20
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --voltages 9 12 --currents 0.5 1 2 --source-current-limit 2.1 --seconds 20
 ```
 
-Voltages and currents must come from the values in the table. The selected
-voltage is the **supply setpoint**; current is the **load's CC setpoint**.
+Voltages and currents are not restricted to the example values in the table.
+Specify any finite positive values in steps of **0.01 V** and **0.01 A**
+(for example `--voltages 3.3 1.8 --currents 0.33 0.12`). The program checks
+the supply's available voltage range, current limit and protection limits before
+enabling its output. The selected voltage is the **supply setpoint**;
+current is the **load's CC setpoint**.
+The lists are traversed in the order given: all currents at the first voltage,
+then all currents at the next voltage. Unless a separate startup phase is
+specified, the first voltage and first load current are the starting operating
+point.
+
+**The supply and load remain on between points and during point retries.**
+The program changes setpoints without switching the RK6006 output off or
+commanding 0 V. This keeps a device under test powered after its initial start.
+
+By default, the initial setup switches the outputs off. Completion, Ctrl+C, exhausted
+retries, communication errors or protection trips end the run and trigger
+shutdown. Actual voltage continuity during setpoint changes depends on the
+supply and the connected circuit.
+Use `--keep-source-on` to preserve source power during setup and on exit as
+described below; the load is still shut down.
+
+### Give the device time to start
+
+To start at **12 V with a 0.5 A source current limit for 60 seconds**, then measure each selected
+point for **15 seconds**, specify all three startup options together:
+
+```powershell
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --startup-voltage 12 --startup-current 0.5 --startup-seconds 60 --voltages 3.3 5 --currents 0.1 0.2 0.5 --source-current-limit 0.6 --seconds 15
+```
+
+The program sets the RK6006 startup voltage and current limit, enables its
+output and waits for the startup duration. **The ATORCH load remains OFF
+throughout startup.** The program then switches to the measurement current
+limit, sets the first measurement voltage and load current, and enables the
+load without switching the source off. Startup is performed
+**only once per run**, even if a measurement point is retried. It is excluded
+from the CSV points, measured energy and sweep progress/ETA; its settings and
+duration are recorded in `debug.jsonl`.
+
+Startup voltage uses **0.01 V** steps; `--startup-current` is the **RK6006
+current limit**, in **0.001 A** steps. Both `--startup-current` and the required
+measurement `--source-current-limit` are applied exactly as specified, with no
+automatic margin. OVP/OCP cover both startup and
+measurement settings. The ATORCH cutoff applies only to measurement voltages,
+because its load is off during startup. Communication errors, protection trips or Ctrl+C abort startup
+and trigger shutdown; temporary source CC mode is allowed during startup.
+
+After startup, `--settle` (default 2 seconds) and the settling checks apply
+before each point and retry. Increasing `--settle` affects every point;
+`--startup-seconds` affects only the initial startup. Omitting all three startup
+options skips the separate startup phase. They cannot be combined with `--probe`.
 
 ### Supply protections
 
-For the default sweep, the program temporarily sets:
+For the 40-point example above, the program temporarily sets:
 
-| Setting | Default full-sweep value |
+| Setting | Example full-sweep value |
 | --- | ---: |
 | Supply current limit | 2.1 A |
 | OVP | 22 V |
 | OCP | 2.31 A |
 
-Smaller sweeps use correspondingly smaller limits. The current limit is 0.1 A
-above the highest selected load current. OVP is 110% of the highest selected
-voltage, and OCP is 110% of the supply current limit. You can specify different
+During measurement, the source current limit is exactly the required
+`--source-current-limit` value (0.001 A steps), fixed across the whole sweep.
+It is independent of `--currents`, which controls the load. Choose the source
+limit for the **input current of the device under test**, including its losses
+and the full selected voltage/load range. For a boost converter producing
+12 V / 1 A from 5 V, even ideal input current is 2.4 A; at 90% efficiency it
+would be about 2.67 A. A load-based input limit is therefore inappropriate.
+There is no default source current limit or automatic current margin.
+
+During startup the source limit is exactly `--startup-current`.
+OVP is 110% of the highest selected
+voltage, including startup, and OCP is 110% of the higher of the two source
+current limits. You can specify different
 OVP/OCP values with `--ovp` and `--ocp`; they must exceed the selected test
 voltage/current limit and fit the instrument's range.
 
-On exit, the program attempts to restore the original supply voltage, current
+By default, on exit the program attempts to restore the original supply voltage, current
 limit, OVP and OCP **after verifying supply OFF**. It leaves the outputs off,
 even if they were on before the test. Any restoration failure is reported.
+
+### Keep the source powered
+
+Add **`--keep-source-on`** to prevent the program from sending any RK6006 OFF
+command during setup, between points, on completion, after an error or on Ctrl+C:
+
+```powershell
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --voltages 5 --currents 0.1 --source-current-limit 1 --keep-source-on
+```
+
+The source is configured and enabled for the requested startup/measurement as
+usual. On exit, its output state and the last applied settings are left in
+place. **Original source voltage, current limit and OVP/OCP are not restored.**
+If initialization fails early, the source retains its existing state; the flag
+does not force an unidentified or unconfigured source ON. The console and debug
+log record that source OFF and restoration were skipped.
+
+The ATORCH load remains OFF during startup and is still turned off and verified
+when the run ends, including errors. Failure to verify load OFF is still reported.
+The source's hardware OVP/OCP remain active and can turn it off independently;
+the program does not re-enable it after a protection trip. Changing voltage or
+current limits can still affect actual output voltage. Without this flag, the
+normal source shutdown and restoration behavior applies.
 
 ## Open the results
 
@@ -163,7 +256,8 @@ failures may leave only the debug log.
 
 Each reported point contains one complete measurement window. If a reading
 leaves the permitted operating range, the program rejects that entire window,
-turns both outputs off and retries the point once. The CSV/HTML **Attempts**
+keeps both outputs on, waits for settling again and retries the point once.
+The CSV/HTML **Attempts**
 column shows whether a point needed repeating. Rejected attempts remain in the
 debug log. Repeated deviations stop the test; communication errors and supply
 protection trips stop it immediately.
@@ -186,8 +280,14 @@ not remove a systematic measurement error.
 
 | Option | Default | When to change it |
 | --- | --- | --- |
-| `--source-port`, `--load-port` | COM3, COM4 | Windows assigned different ports |
+| `--voltages`, `--currents` | None; both required for measurement | Explicitly choose the operating points for this run |
+| `--source-current-limit` | None; required for measurement | Set the RK6006 measurement current limit independently of load current |
+| `--source-port`, `--load-port` | None; both required | Explicitly identify the connected devices |
+| `--list-ports` | Off | List available serial ports and exit without opening them |
 | `--seconds` | 10 | Measure each settled point for longer |
+| `--startup-voltage`, `--startup-current`, `--startup-seconds` | None; all three required together | Run a separate one-time startup phase |
+| `--debug-serial` | Off | Print both ports' raw TX/RX in hex, including identification |
+| `--keep-source-on` | Off | Skip all source OFF commands and source restoration, including on errors/Ctrl+C; still shut down the load |
 | `--settle` | 2 | Wait longer before checking settling |
 | `--settle-timeout` | 15 | Allow slower settling; must exceed `--settle` |
 | `--point-retries` | 1 | Set `0` to stop on the first rejected window |
@@ -196,7 +296,7 @@ not remove a systematic measurement error.
 For example, allow a slower setup to settle:
 
 ```powershell
-.\.venv\Scripts\python.exe .\measure_efficiency.py --settle 5 --settle-timeout 30
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --voltages 5 --currents 0.1 --source-current-limit 0.2 --settle 5 --settle-timeout 30
 ```
 
 By default, acceptable readings require source CV mode, supply voltage within
@@ -213,6 +313,34 @@ reading before relaxing them.
 cable, and close other applications using the port. Start with `--probe`.
 After a communication fault, check OFF locally before restarting.
 
+For detailed serial diagnostics without changing settings, use the actual ports:
+
+```powershell
+.\.venv\Scripts\python.exe .\measure_efficiency.py --source-port COM4 --load-port COM3 --probe --debug-serial
+```
+
+`--debug-serial` prints monotonic timestamps, device name, port, baud rate,
+TX/RX bytes in hex, read sizes, empty reads and transport errors to stderr.
+It includes RK6006 identification, so it also captures checksum errors or no
+answer before the device is recognized. During measurement these raw exchanges
+are additionally recorded in `debug.jsonl`; `--probe` creates no results folder.
+Tracing does not add commands or retries and can increase communication overhead.
+
+The parser handles a command reply following an interrupted automatic ATORCH
+report. Such recovery is recorded as `atorch_report_interrupted` in the debug
+log; current and ON/OFF settings still require a separate readback confirmation.
+Missing replies or failed readbacks still stop the run.
+Extra standalone ACK bytes are logged as `atorch_ack_ignored`; when reading a
+value, the parser keeps waiting for a complete data reply within the original
+timeout. An ACK alone cannot confirm a current setting or load state.
+
+RK6006 uses 115200 baud and Modbus address 1; ATORCH uses 9600 baud. A checksum
+error containing only zero bytes means the received frame was invalid. A
+"no answer" error means no valid reply arrived. Neither identifies the physical
+cause: check which port belongs to the supply, its communication settings and
+the USB connection. A failure during RK6006 identification occurs before this
+program can issue an OFF command or change any settings.
+
 **OVP or OCP:** the program displays the test limits. Read the reported
 protection and check the wiring and intended current before raising limits.
 
@@ -221,6 +349,12 @@ its cutoff and compare the displays. The program records both instruments'
 readings and retains rejected samples in `debug.jsonl`. An isolated outlier may
 come from measurement or communication; a correctly decoded number alone does
 not prove a real current transient. The retry repeats the entire point.
+Settling errors include the actual source/load voltage and current, identify
+zero, negative or nonfinite readings, and show the requested operating point
+and tolerances. A source CV-mode failure includes its mode and actual readings;
+the error also reports the load readings. If the last samples were acceptable
+but fewer than three consecutive pairs were collected, the error gives that
+count and the last measurements.
 
 **Unexpected voltage drop or efficiency:** measure voltage directly at both
 sets of terminals with a multimeter in DC voltage mode. Check contacts, sense
